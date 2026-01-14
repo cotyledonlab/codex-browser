@@ -18,6 +18,16 @@ codex-browser --json '{"actions":[{"type":"goto","url":"https://example.com"}]}'
 cat request.json | codex-browser
 ```
 
+### CI / Agent-friendly flags
+
+- `--trace-on-failure <dir>`: write a Playwright trace zip only if a step fails
+- `--capture-console`: include browser `console` + `pageerror` entries in the JSON output
+
+CLI flags:
+
+- `--headed`: run with a visible browser window (overrides `options.headless`)
+- `--headless`: run without a visible browser window (default; overrides `options.headless`)
+
 ## Input JSON
 
 Top-level shape:
@@ -33,7 +43,9 @@ Top-level shape:
     "userAgent": "...",
     "locale": "en-US",
     "timezoneId": "UTC",
-    "ignoreHTTPSErrors": false
+    "ignoreHTTPSErrors": false,
+    "traceOnFailureDir": "./artifacts",
+    "captureConsole": false
   },
   "actions": [
     { "type": "goto", "url": "https://example.com" },
@@ -47,6 +59,7 @@ Supported actions (in order):
 
 - `goto`: `{ type, url, waitUntil?, timeoutMs? }`
 - `waitFor`: `{ type, selector, state?, timeoutMs? }`
+- `waitForLoadState`: `{ type, state?, timeoutMs? }`
 - `click`: `{ type, selector, button?, clickCount?, delayMs?, timeoutMs? }`
 - `fill`: `{ type, selector, text, timeoutMs? }`
 - `press`: `{ type, key, selector?, timeoutMs? }`
@@ -61,6 +74,7 @@ Notes:
 - Paths in `screenshot.path` are resolved relative to the current working directory.
 - Every action supports `saveAs` to store its output in a variable name.
 - String fields support templating with `{{var}}` or `{{var.path}}` for stored values.
+- Prefer `waitFor`/`waitForLoadState` over `wait` to avoid nondeterministic sleeps.
 
 Example with `saveAs` + templates:
 
@@ -101,8 +115,11 @@ Error:
 {
   "ok": false,
   "error": {
-    "name": "Error",
-    "message": "..."
+    "code": "PLAYWRIGHT_TIMEOUT",
+    "name": "TimeoutError",
+    "message": "Timeout 30000ms exceeded.",
+    "stepIndex": 2,
+    "action": { "type": "waitFor", "selector": "#does-not-exist", "timeoutMs": 30000 }
   }
 }
 ```

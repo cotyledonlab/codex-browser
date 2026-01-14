@@ -4,6 +4,25 @@ import fs from 'fs/promises';
 import path from 'path';
 import { chromium, type Browser, type Page } from 'playwright';
 
+type ConsoleEntry = {
+  type: string;
+  text: string;
+  location?: { url: string; lineNumber: number; columnNumber: number };
+};
+
+type PageErrorEntry = {
+  message: string;
+  stack?: string;
+};
+
+type ErrorCode =
+  | 'INVALID_INPUT'
+  | 'TEMPLATE_ERROR'
+  | 'INTERRUPTED'
+  | 'PLAYWRIGHT_TIMEOUT'
+  | 'PLAYWRIGHT_ERROR'
+  | 'UNKNOWN';
+
 type Viewport = {
   width: number;
   height: number;
@@ -19,6 +38,8 @@ type Options = {
   locale?: string;
   timezoneId?: string;
   ignoreHTTPSErrors?: boolean;
+  traceOnFailureDir?: string;
+  captureConsole?: boolean;
 };
 
 type ActionBase = {
@@ -37,6 +58,12 @@ type WaitForAction = ActionBase & {
   type: 'waitFor';
   selector: string;
   state?: 'attached' | 'detached' | 'visible' | 'hidden';
+  timeoutMs?: number;
+};
+
+type WaitForLoadStateAction = ActionBase & {
+  type: 'waitForLoadState';
+  state?: 'load' | 'domcontentloaded' | 'networkidle';
   timeoutMs?: number;
 };
 
@@ -88,6 +115,7 @@ type WaitAction = ActionBase & {
 type Action =
   | GotoAction
   | WaitForAction
+  | WaitForLoadStateAction
   | ClickAction
   | FillAction
   | PressAction
@@ -108,21 +136,36 @@ type ActionResult = {
   data?: Record<string, unknown>;
 };
 
+type ActionMetaResult = ActionResult & {
+  index: number;
+  timingMs: number;
+};
+
 type OutputPayload = {
   ok: true;
-  results: ActionResult[];
+  results: ActionMetaResult[];
   timingMs: number;
   variables?: Record<string, unknown>;
+  console?: ConsoleEntry[];
+  pageErrors?: PageErrorEntry[];
 };
 
 type ErrorPayload = {
   ok: false;
   error: {
+    code: ErrorCode;
     name: string;
     message: string;
     stack?: string;
+    stepIndex?: number;
+    action?: Action;
+    tracePath?: string;
+    resultsSoFar?: ActionMetaResult[];
+    console?: ConsoleEntry[];
+    pageErrors?: PageErrorEntry[];
   };
 };
+
 
 type CliArgs = {
   inputPath?: string;
@@ -130,8 +173,11 @@ type CliArgs = {
   outputPath?: string;
   pretty?: boolean;
   debug?: boolean;
+  traceOnFailureDir?: string;
+  captureConsole?: boolean;
   help?: boolean;
   version?: boolean;
+  headlessOverride?: boolean;
 };
 
 const DEFAULT_VIEWPORT: Viewport = { width: 1280, height: 720 };
@@ -145,13 +191,17 @@ Usage:
   cat request.json | codex-browser
 
 Options:
-  --input <path>    Read JSON payload from file
-  --json <string>   Read JSON payload from inline string
-  --output <path>   Write JSON response to file (still prints to stdout)
-  --pretty          Pretty-print JSON output
-  --debug           Include stack traces on errors
-  --help            Show this help
-  --version         Show version
+  --input <path>             Read JSON payload from file
+  --json <string>            Read JSON payload from inline string
+  --output <path>            Write JSON response to file (still prints to stdout)
+  --trace-on-failure <dir>   Write Playwright trace zip on failure
+  --capture-console          Capture browser console/pageerror into output JSON
+  --headed                   Run with a visible browser window
+  --headless                 Run without a visible browser window (default)
+  --pretty                   Pretty-print JSON output
+  --debug                    Include stack traces on errors
+  --help                     Show this help
+  --version                  Show version
 `;
 
 async function readStdin(): Promise<string> {
@@ -173,21 +223,21 @@ function parseArgs(argv: string[]): CliArgs {
     switch (arg) {
       case '--input':
         if (!argv[i + 1]) {
-          throw new Error('Missing value for --input');
+          throw new CodexBrowserError('INVALID_INPUT', 'Missing value for --input');
         }
         args.inputPath = argv[i + 1];
         i += 1;
         break;
       case '--json':
         if (!argv[i + 1]) {
-          throw new Error('Missing value for --json');
+          throw new CodexBrowserError('INVALID_INPUT', 'Missing value for --json');
         }
         args.json = argv[i + 1];
         i += 1;
         break;
       case '--output':
         if (!argv[i + 1]) {
-          throw new Error('Missing value for --output');
+          throw new CodexBrowserError('INVALID_INPUT', 'Missing value for --output');
         }
         args.outputPath = argv[i + 1];
         i += 1;
@@ -198,6 +248,28 @@ function parseArgs(argv: string[]): CliArgs {
       case '--debug':
         args.debug = true;
         break;
+      case '--headed':
+        if (args.headlessOverride !== undefined && args.headlessOverride !== false) {
+          throw new CodexBrowserError('INVALID_INPUT', 'Cannot use --headed and --headless together');
+        }
+        args.headlessOverride = false;
+        break;
+      case '--headless':
+        if (args.headlessOverride !== undefined && args.headlessOverride !== true) {
+          throw new CodexBrowserError('INVALID_INPUT', 'Cannot use --headed and --headless together');
+        }
+        args.headlessOverride = true;
+        break;
+      case '--trace-on-failure':
+        if (!argv[i + 1]) {
+          throw new CodexBrowserError('INVALID_INPUT', 'Missing value for --trace-on-failure');
+        }
+        args.traceOnFailureDir = argv[i + 1];
+        i += 1;
+        break;
+      case '--capture-console':
+        args.captureConsole = true;
+        break;
       case '--help':
       case '-h':
         args.help = true;
@@ -207,7 +279,7 @@ function parseArgs(argv: string[]): CliArgs {
         args.version = true;
         break;
       default:
-        throw new Error(`Unknown argument: ${arg}`);
+        throw new CodexBrowserError('INVALID_INPUT', `Unknown argument: ${arg}`);
     }
   }
   return args;
@@ -215,21 +287,31 @@ function parseArgs(argv: string[]): CliArgs {
 
 function ensureObject(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
+    throw new CodexBrowserError('INVALID_INPUT', `${label} must be an object`);
   }
   return value as Record<string, unknown>;
 }
 
+class CodexBrowserError extends Error {
+  public code: ErrorCode;
+
+  constructor(code: ErrorCode, message: string) {
+    super(message);
+    this.name = 'CodexBrowserError';
+    this.code = code;
+  }
+}
+
 function ensureString(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0) {
-    throw new Error(`${label} must be a non-empty string`);
+    throw new CodexBrowserError('INVALID_INPUT', `${label} must be a non-empty string`);
   }
   return value;
 }
 
 function ensureNumber(value: unknown, label: string): number {
   if (typeof value !== 'number' || Number.isNaN(value)) {
-    throw new Error(`${label} must be a number`);
+    throw new CodexBrowserError('INVALID_INPUT', `${label} must be a number`);
   }
   return value;
 }
@@ -246,7 +328,7 @@ function ensureOptionalBoolean(value: unknown, label: string): boolean | undefin
     return undefined;
   }
   if (typeof value !== 'boolean') {
-    throw new Error(`${label} must be a boolean`);
+    throw new CodexBrowserError('INVALID_INPUT', `${label} must be a boolean`);
   }
   return value;
 }
@@ -264,7 +346,7 @@ function ensureOptionalSaveAs(value: unknown, label: string): string | undefined
   }
   const name = ensureString(value, label);
   if (!/^[A-Za-z0-9_-]+$/.test(name)) {
-    throw new Error(`${label} must use only letters, numbers, underscores, or dashes`);
+    throw new CodexBrowserError('INVALID_INPUT', `${label} must use only letters, numbers, underscores, or dashes`);
   }
   return name;
 }
@@ -278,7 +360,7 @@ function ensureOptionalOneOf<T extends string>(
     return undefined;
   }
   if (typeof value !== 'string' || !allowed.includes(value as T)) {
-    throw new Error(`${label} must be one of: ${allowed.join(', ')}`);
+    throw new CodexBrowserError('INVALID_INPUT', `${label} must be one of: ${allowed.join(', ')}`);
   }
   return value as T;
 }
@@ -321,6 +403,9 @@ function validateOptions(value: unknown): Options | undefined {
     'options.ignoreHTTPSErrors'
   );
 
+  options.traceOnFailureDir = ensureOptionalString(obj.traceOnFailureDir, 'options.traceOnFailureDir');
+  options.captureConsole = ensureOptionalBoolean(obj.captureConsole, 'options.captureConsole');
+
   return options;
 }
 
@@ -343,6 +428,13 @@ function validateAction(value: unknown, index: number): Action {
         type: 'waitFor',
         selector: ensureString(obj.selector, `actions[${index}].selector`),
         state: ensureOptionalOneOf(obj.state, ['attached', 'detached', 'visible', 'hidden'], `actions[${index}].state`),
+        timeoutMs: ensureOptionalNumber(obj.timeoutMs, `actions[${index}].timeoutMs`),
+        saveAs
+      };
+    case 'waitForLoadState':
+      return {
+        type: 'waitForLoadState',
+        state: ensureOptionalOneOf(obj.state, ['load', 'domcontentloaded', 'networkidle'], `actions[${index}].state`),
         timeoutMs: ensureOptionalNumber(obj.timeoutMs, `actions[${index}].timeoutMs`),
         saveAs
       };
@@ -399,21 +491,28 @@ function validateAction(value: unknown, index: number): Action {
         saveAs
       };
     default:
-      throw new Error(`actions[${index}].type is unsupported: ${type}`);
+       throw new CodexBrowserError('INVALID_INPUT', `actions[${index}].type is unsupported: ${type}`);
+
   }
 }
 
 function parseInput(raw: string): InputPayload {
-  const parsed = JSON.parse(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new CodexBrowserError('INVALID_INPUT', `Invalid JSON: ${(err as Error).message}`);
+  }
   const obj = ensureObject(parsed, 'input');
 
   if (!Array.isArray(obj.actions)) {
-    throw new Error('actions must be an array');
+      throw new CodexBrowserError('INVALID_INPUT', 'actions must be an array');
+
   }
 
   const actions = obj.actions.map((action, index) => validateAction(action, index));
   if (actions.length === 0) {
-    throw new Error('actions must contain at least one entry');
+    throw new CodexBrowserError('INVALID_INPUT', 'actions must contain at least one entry');
   }
 
   const options = validateOptions(obj.options);
@@ -421,14 +520,69 @@ function parseInput(raw: string): InputPayload {
   return { actions, options };
 }
 
-function serializeError(err: unknown, includeStack: boolean): ErrorPayload {
+function inferErrorCode(err: unknown): ErrorCode {
+  if (err instanceof CodexBrowserError) {
+    return err.code;
+  }
+
+  if (err && typeof err === 'object') {
+    const anyErr = err as { name?: unknown; message?: unknown };
+    const name = typeof anyErr.name === 'string' ? anyErr.name : '';
+
+    if (name === 'TimeoutError') {
+      return 'PLAYWRIGHT_TIMEOUT';
+    }
+
+    if (name.toLowerCase().includes('playwright')) {
+      return 'PLAYWRIGHT_ERROR';
+    }
+  }
+
+  return 'UNKNOWN';
+}
+
+function extractErrorPayload(err: unknown): ErrorPayload | undefined {
+  if (!err || typeof err !== 'object') {
+    return undefined;
+  }
+  const record = err as { ok?: unknown; error?: unknown };
+  if (record.ok !== false || !record.error || typeof record.error !== 'object') {
+    return undefined;
+  }
+  const errorObj = record.error as { code?: unknown; name?: unknown; message?: unknown };
+  if (typeof errorObj.code !== 'string' || typeof errorObj.name !== 'string' || typeof errorObj.message !== 'string') {
+    return undefined;
+  }
+  return err as ErrorPayload;
+}
+
+function serializeError(
+  err: unknown,
+  includeStack: boolean,
+  extras?: {
+    code?: ErrorCode;
+    stepIndex?: number;
+    action?: Action;
+    tracePath?: string;
+    resultsSoFar?: ActionMetaResult[];
+    console?: ConsoleEntry[];
+    pageErrors?: PageErrorEntry[];
+  }
+): ErrorPayload {
   const error = err instanceof Error ? err : new Error(String(err));
   return {
     ok: false,
     error: {
+      code: extras?.code ?? inferErrorCode(err),
       name: error.name,
       message: error.message,
-      stack: includeStack ? error.stack : undefined
+      stack: includeStack ? error.stack : undefined,
+      stepIndex: extras?.stepIndex,
+      action: extras?.action,
+      tracePath: extras?.tracePath,
+      resultsSoFar: extras?.resultsSoFar,
+      console: extras?.console,
+      pageErrors: extras?.pageErrors
     }
   };
 }
@@ -439,7 +593,7 @@ function readVarPath(value: unknown, pathParts: string[], pathLabel: string): un
     if (current && typeof current === 'object' && Object.prototype.hasOwnProperty.call(current, part)) {
       current = (current as Record<string, unknown>)[part];
     } else {
-      throw new Error(`Template path not found: ${pathLabel}`);
+      throw new CodexBrowserError('TEMPLATE_ERROR', `Template path not found: ${pathLabel}`);
     }
   }
   return current;
@@ -452,14 +606,14 @@ function resolveTemplate(value: string, vars: Record<string, unknown>): string {
   return value.replace(TEMPLATE_REGEX, (_match, rawPath: string) => {
     const pathParts = rawPath.split('.').filter(Boolean);
     if (pathParts.length === 0) {
-      throw new Error('Template path cannot be empty');
+      throw new CodexBrowserError('TEMPLATE_ERROR', 'Template path cannot be empty');
     }
     const resolved = readVarPath(vars, pathParts, rawPath);
     if (resolved === null || resolved === undefined) {
-      throw new Error(`Template path resolves to empty value: ${rawPath}`);
+      throw new CodexBrowserError('TEMPLATE_ERROR', `Template path resolves to empty value: ${rawPath}`);
     }
     if (typeof resolved === 'object') {
-      throw new Error(`Template path resolves to a non-primitive: ${rawPath}`);
+      throw new CodexBrowserError('TEMPLATE_ERROR', `Template path resolves to a non-primitive: ${rawPath}`);
     }
     return String(resolved);
   });
@@ -537,6 +691,16 @@ async function runAction(page: Page, action: Action, cwd: string): Promise<Actio
         }
       };
     }
+    case 'waitForLoadState': {
+      await page.waitForLoadState(action.state, { timeout: action.timeoutMs });
+      return {
+        type: action.type,
+        ok: true,
+        data: {
+          state: action.state ?? 'load'
+        }
+      };
+    }
     case 'click': {
       await page.click(action.selector, {
         button: action.button,
@@ -577,17 +741,22 @@ async function runAction(page: Page, action: Action, cwd: string): Promise<Actio
       return { type: action.type, ok: true, data: { ms: action.ms } };
     }
     default:
-      throw new Error(`Unsupported action: ${(action as Action).type}`);
+      throw new CodexBrowserError('INVALID_INPUT', `Unsupported action: ${(action as Action).type}`);
   }
 }
 
-async function runBrowser(payload: InputPayload): Promise<OutputPayload> {
+async function runBrowser(payload: InputPayload, includeStack: boolean): Promise<OutputPayload> {
   const start = Date.now();
   const options = payload.options ?? {};
   const browser: Browser = await chromium.launch({
     headless: options.headless ?? true,
     slowMo: options.slowMoMs
   });
+
+  const consoleEntries: ConsoleEntry[] = [];
+  const pageErrors: PageErrorEntry[] = [];
+
+  let interrupted = false;
 
   try {
     const context = await browser.newContext({
@@ -598,7 +767,21 @@ async function runBrowser(payload: InputPayload): Promise<OutputPayload> {
       ignoreHTTPSErrors: options.ignoreHTTPSErrors
     });
 
+    const shouldTrace = Boolean(options.traceOnFailureDir);
+    if (shouldTrace) {
+      await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+    }
+
     const page = await context.newPage();
+    if (options.captureConsole) {
+      page.on('console', (msg) => {
+        consoleEntries.push({ type: msg.type(), text: msg.text(), location: msg.location() });
+      });
+      page.on('pageerror', (err) => {
+        pageErrors.push({ message: err.message, stack: err.stack });
+      });
+    }
+
     if (options.defaultTimeoutMs !== undefined) {
       page.setDefaultTimeout(options.defaultTimeoutMs);
     }
@@ -606,30 +789,99 @@ async function runBrowser(payload: InputPayload): Promise<OutputPayload> {
       page.setDefaultNavigationTimeout(options.defaultNavigationTimeoutMs);
     }
 
-    const results: ActionResult[] = [];
+    const results: ActionMetaResult[] = [];
     const cwd = process.cwd();
 
     const vars: Record<string, unknown> = {};
 
-    for (const action of payload.actions) {
-      const resolvedAction = resolveActionTemplates(action, vars);
-      const result = await runAction(page, resolvedAction, cwd);
-      if (action.saveAs) {
-        vars[action.saveAs] = getSavedValue(resolvedAction, result);
-        result.savedAs = action.saveAs;
+    const stopTracing = async (tracePath?: string): Promise<void> => {
+      if (!shouldTrace) {
+        return;
       }
-      results.push(result);
-    }
-
-    const outputPayload: OutputPayload = {
-      ok: true,
-      results,
-      timingMs: Date.now() - start
+      if (tracePath) {
+        await fs.mkdir(path.dirname(tracePath), { recursive: true });
+        await context.tracing.stop({ path: tracePath });
+      } else {
+        await context.tracing.stop();
+      }
     };
-    if (Object.keys(vars).length > 0) {
-      outputPayload.variables = vars;
+
+    let currentActionIndex = -1;
+    let currentResolvedAction: Action | undefined;
+
+    const onSignal = (): void => {
+      interrupted = true;
+      void browser.close();
+    };
+
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+
+    try {
+      for (let index = 0; index < payload.actions.length; index += 1) {
+        if (interrupted) {
+          throw new CodexBrowserError('INTERRUPTED', 'Interrupted');
+        }
+
+        currentActionIndex = index;
+        const action = payload.actions[index];
+        currentResolvedAction = resolveActionTemplates(action, vars);
+
+        const actionStart = Date.now();
+        const result = await runAction(page, currentResolvedAction, cwd);
+        const actionTimingMs = Date.now() - actionStart;
+
+        if (action.saveAs) {
+          vars[action.saveAs] = getSavedValue(currentResolvedAction, result);
+          result.savedAs = action.saveAs;
+        }
+
+        results.push({ ...result, index, timingMs: actionTimingMs });
+      }
+
+      await stopTracing();
+
+      const outputPayload: OutputPayload = {
+        ok: true,
+        results,
+        timingMs: Date.now() - start
+      };
+      if (Object.keys(vars).length > 0) {
+        outputPayload.variables = vars;
+      }
+      if (options.captureConsole && consoleEntries.length > 0) {
+        outputPayload.console = consoleEntries;
+      }
+      if (options.captureConsole && pageErrors.length > 0) {
+        outputPayload.pageErrors = pageErrors;
+      }
+      return outputPayload;
+    } catch (err) {
+      let tracePath: string | undefined;
+      if (shouldTrace && options.traceOnFailureDir) {
+        tracePath = path.resolve(
+          process.cwd(),
+          options.traceOnFailureDir,
+          `trace-failure-${process.pid}-${Date.now()}.zip`
+        );
+        await stopTracing(tracePath);
+      }
+
+      const errorCode: ErrorCode = inferErrorCode(err);
+
+      throw serializeError(err, includeStack, {
+        code: errorCode,
+        stepIndex: currentActionIndex >= 0 ? currentActionIndex : undefined,
+        action: currentResolvedAction,
+        tracePath,
+        resultsSoFar: results,
+        console: options.captureConsole && consoleEntries.length > 0 ? consoleEntries : undefined,
+        pageErrors: options.captureConsole && pageErrors.length > 0 ? pageErrors : undefined
+      });
+    } finally {
+      process.removeListener('SIGINT', onSignal);
+      process.removeListener('SIGTERM', onSignal);
     }
-    return outputPayload;
   } finally {
     await browser.close();
   }
@@ -659,11 +911,11 @@ async function loadInput(args: CliArgs): Promise<InputPayload> {
   } else if (!process.stdin.isTTY) {
     raw = await readStdin();
   } else {
-    throw new Error('No input provided. Use --json, --input, or pipe JSON via stdin.');
+    throw new CodexBrowserError('INVALID_INPUT', 'No input provided. Use --json, --input, or pipe JSON via stdin.');
   }
 
   if (raw.trim().length === 0) {
-    throw new Error('No input provided. Use --json, --input, or pipe JSON via stdin.');
+    throw new CodexBrowserError('INVALID_INPUT', 'No input provided. Use --json, --input, or pipe JSON via stdin.');
   }
 
   return parseInput(raw);
@@ -686,10 +938,21 @@ async function main(): Promise<void> {
 
   try {
     const payload = await loadInput(args);
-    const output = await runBrowser(payload);
+
+    payload.options = {
+      ...payload.options,
+      traceOnFailureDir: args.traceOnFailureDir ?? payload.options?.traceOnFailureDir,
+      captureConsole: args.captureConsole ?? payload.options?.captureConsole
+    };
+
+    if (args.headlessOverride !== undefined) {
+      payload.options = { ...payload.options, headless: args.headlessOverride };
+    }
+
+    const output = await runBrowser(payload, args.debug ?? false);
     await writeOutput(output, args.outputPath, args.pretty ?? false);
   } catch (err) {
-    const errorPayload = serializeError(err, args.debug ?? false);
+    const errorPayload = extractErrorPayload(err) ?? serializeError(err, args.debug ?? false);
     await writeOutput(errorPayload, args.outputPath, args.pretty ?? false);
     process.exitCode = 1;
   }
